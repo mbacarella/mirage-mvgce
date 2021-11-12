@@ -12,8 +12,6 @@ let http_src = Logs.Src.create "http" ~doc:"HTTP server"
 
 module Http_log = (val Logs.src_log http_src : Logs.LOG)
 
-let letsencrypt_tokens = Hashtbl.create 1
-
 module Dispatch (FS : Mirage_kv.RO) (S : HTTP) = struct
   let failf fmt = Fmt.kstr Lwt.fail_with fmt
 
@@ -34,7 +32,8 @@ module Dispatch (FS : Mirage_kv.RO) (S : HTTP) = struct
         (fun _exn -> S.respond_not_found ())
 
   (* Answer letsencrypt verification queries and redirect everything else to HTTPS. *)
-  let letsencrypt_or_redirect port uri =
+  let letsencrypt_or_redirect ~letsencrypt_tokens ~port uri =
+    Http_log.info (fun f -> f "request: %s" (Uri.to_string uri));
     let path = Uri.path uri in
     match
       String.split_on_char '/' path
@@ -81,9 +80,10 @@ module HTTPS
     (Conduit : Conduit_mirage.S)
     (Data : Mirage_kv.RO)
     (Time : Mirage_time.S)
-    (Http : HTTP) =
+    (Http_client : Cohttp_lwt.S.Client)
+    (Http_server : HTTP) =
 struct
-  module D = Dispatch (Data) (Http)
+  module D = Dispatch (Data) (Http_server)
 
   let certificate_seed = None
   let certificate_key_bits = None
@@ -116,52 +116,68 @@ struct
       let cn = X509.[ Distinguished_name.(Relative_distinguished_name.singleton (CN host)) ] in
       X509.Signing_request.create cn key
 
-    let solver _host ~prefix:_ ~token ~content =
-      Hashtbl.replace letsencrypt_tokens token content;
+    let solver _host ~tokens ~prefix:_ ~token ~content =
+      Hashtbl.replace tokens token content;
       Lwt.return (Ok ())
 
-    let provision ~production =
+    let provision_certificate ~ctx ~production ~letsencrypt_tokens =
       let ( >>? ) = Lwt_result.bind in
       let endpoint =
         if production
         then Letsencrypt.letsencrypt_production_url
         else Letsencrypt.letsencrypt_staging_url
       in
+      Https_log.info (fun f ->
+          f "ACME endpoint: %s (production: %B)" (Uri.to_string endpoint) production);
       let priv = gen_key ?seed:certificate_seed ?bits:certificate_key_bits certificate_key_type in
       let my_hostname =
         let hostname_s = Key_gen.hostname () in
+        Https_log.info (fun f -> f "my hostname: %s" hostname_s);
         match Domain_name.of_string hostname_s with
         | Ok domain -> domain
         | Error (`Msg s) -> failwith (Printf.sprintf "Invalid hostname '%s': %s" hostname_s s)
       in
+      Https_log.info (fun f -> f "create CSR");
       match csr priv my_hostname with
       | Error _ as err -> Lwt.return err
       | Ok csr ->
         let account_key = gen_key ?seed:account_seed ?bits:account_key_bits account_key_type in
-        Acme_cohttp.initialise ?email:email_address ~endpoint account_key
+        Https_log.info (fun f -> f "Acme_cohttp.initialize");
+        Acme_cohttp.initialise ?email:email_address ~ctx ~endpoint account_key
         >>? fun le ->
         let sleep sec = Time.sleep_ns (Duration.of_sec sec) in
-        let solver = Letsencrypt.Client.http_solver solver in
+        let solver =
+          let solver host ~prefix ~token ~content =
+            solver host ~prefix ~tokens:letsencrypt_tokens ~token ~content
+          in
+          Letsencrypt.Client.http_solver solver
+        in
+        Https_log.info (fun f -> f "Acme_cohttp.sign");
         Acme_cohttp.sign_certificate solver le sleep csr
         >>? fun certs -> Lwt.return_ok (`Single (certs, priv))
 
-    let tls_config ?(production = true) () =
-      provision ~production
+    let tls_config ?(production = true) ~ctx ~letsencrypt_tokens () =
+      provision_certificate ~ctx ~production ~letsencrypt_tokens
       >>= fun res ->
       match res with
       | Error (`Msg s) -> failwith (Printf.sprintf "Failed to provision certificate: %s" s)
       | Ok certificates -> Lwt.return (Tls.Config.server ~certificates ())
   end
 
-  let start _clock _resolver _conduit_tls data _time start_http =
+  let start _clock _resolver _conduit_tls data _time cohttp_client start_http =
+    let letsencrypt_tokens = Hashtbl.create 1 in
     let http =
       let http_port = Key_gen.http_port () in
       let tcp = `TCP http_port in
       Http_log.info (fun f -> f "listening on %d/TCP" http_port);
-      start_http tcp @@ D.serve (D.letsencrypt_or_redirect http_port)
+      start_http tcp @@ D.serve (D.letsencrypt_or_redirect ~letsencrypt_tokens ~port:http_port)
     in
     Https_log.info (fun f -> f "provisioning TLS certificate with ACME/Let's Encrypt");
-    Letsencrypt_cert.tls_config ()
+    Letsencrypt_cert.tls_config
+      ~ctx:cohttp_client
+      ~production:(Key_gen.le_production ())
+      ~letsencrypt_tokens
+      ()
     >>= fun tls_cfg ->
     let https =
       let https_port = Key_gen.https_port () in
