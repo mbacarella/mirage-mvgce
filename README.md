@@ -1,8 +1,8 @@
 Mirage Minimum Viable GCE
 ====
 
-This repo demonstrates how to set up a TLS-with-Lets-Encrypt enabled static web
-server on GCE.
+This repo demonstrates how to set up a a static web site trusted TLS provided by Lets-Encrypt,
+on a MirageOS unikernel deployed to GCE.
 
 Aside from the actual OCaml code to do this, this repo also has some scripts that
 run gcloud commands necessary to deploy a new image to an existing GCE instance.
