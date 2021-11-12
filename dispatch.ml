@@ -33,7 +33,6 @@ module Dispatch (FS : Mirage_kv.RO) (S : HTTP) = struct
 
   (* Answer letsencrypt verification queries and redirect everything else to HTTPS. *)
   let letsencrypt_or_redirect ~letsencrypt_tokens ~port uri =
-    Http_log.info (fun f -> f "request: %s" (Uri.to_string uri));
     let path = Uri.path uri in
     match
       String.split_on_char '/' path
@@ -42,10 +41,13 @@ module Dispatch (FS : Mirage_kv.RO) (S : HTTP) = struct
              | _ -> true)
     with
     | [ ".well-known"; "acme-challenge"; token ] ->
-      Http_log.info (fun f -> f "Let's Encrypt challenge lookup: %s" path);
+      Http_log.info (fun f -> f "ACME challenge lookup: %s" path);
       (match Hashtbl.find_opt letsencrypt_tokens token with
-      | None -> S.respond ~status:`Not_found ~body:`Empty ()
+      | None ->
+        Http_log.info (fun f -> f "ACME challenge token not found: %s" token);
+        S.respond ~status:`Not_found ~body:`Empty ()
       | Some data ->
+        Http_log.info (fun f -> f "ACME challenge token found");
         let headers =
           Cohttp.Header.of_list
             [ "content-type", "application/octet-stream";
@@ -120,7 +122,7 @@ struct
       Hashtbl.replace tokens token content;
       Lwt.return (Ok ())
 
-    let provision_certificate ~ctx ~production ~letsencrypt_tokens =
+    let provision_certificate ~cohttp_ctx ~production ~letsencrypt_tokens =
       let ( >>? ) = Lwt_result.bind in
       let endpoint =
         if production
@@ -143,7 +145,7 @@ struct
       | Ok csr ->
         let account_key = gen_key ?seed:account_seed ?bits:account_key_bits account_key_type in
         Https_log.info (fun f -> f "Acme_cohttp.initialize");
-        Acme_cohttp.initialise ?email:email_address ~ctx ~endpoint account_key
+        Acme_cohttp.initialise ?email:email_address ~ctx:cohttp_ctx ~endpoint account_key
         >>? fun le ->
         let sleep sec = Time.sleep_ns (Duration.of_sec sec) in
         let solver =
@@ -153,11 +155,11 @@ struct
           Letsencrypt.Client.http_solver solver
         in
         Https_log.info (fun f -> f "Acme_cohttp.sign");
-        Acme_cohttp.sign_certificate solver le sleep csr
+        Acme_cohttp.sign_certificate ~ctx:cohttp_ctx solver le sleep csr
         >>? fun certs -> Lwt.return_ok (`Single (certs, priv))
 
-    let tls_config ?(production = true) ~ctx ~letsencrypt_tokens () =
-      provision_certificate ~ctx ~production ~letsencrypt_tokens
+    let tls_config ?(production = true) ~cohttp_ctx ~letsencrypt_tokens () =
+      provision_certificate ~cohttp_ctx ~production ~letsencrypt_tokens
       >>= fun res ->
       match res with
       | Error (`Msg s) -> failwith (Printf.sprintf "Failed to provision certificate: %s" s)
@@ -174,11 +176,12 @@ struct
     in
     Https_log.info (fun f -> f "provisioning TLS certificate with ACME/Let's Encrypt");
     Letsencrypt_cert.tls_config
-      ~ctx:cohttp_client
+      ~cohttp_ctx:cohttp_client
       ~production:(Key_gen.le_production ())
       ~letsencrypt_tokens
       ()
     >>= fun tls_cfg ->
+    Https_log.info (fun f -> f "TLS certificates provisioned");
     let https =
       let https_port = Key_gen.https_port () in
       let tls = `TLS (tls_cfg, `TCP https_port) in

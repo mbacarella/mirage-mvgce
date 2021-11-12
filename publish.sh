@@ -8,9 +8,10 @@ export IDENTIFIER=$(date '+%Y%m%d%H%M%S')
 set -e
 
 ./build.sh
-solo5-virtio-mkimage -f tar -- mvgce.tar.gz ./mvgce.virtio -- --ipv4-only=true --hostname mvgce.bacarella.com
-
-gsutil cp mvgce.tar.gz gs://$MY_PROJECT/mvgce.tar.gz
+solo5-virtio-mkimage -f tar -- mvgce.tar.gz ./mvgce.virtio \
+  --ipv4-only=true \
+  --le_production=true \
+  --hostname=mvgce.bacarella.com
 
 # Since it takes awhile, in a separate thread, stop the instance and detach the disk
 (
@@ -22,6 +23,7 @@ gsutil cp mvgce.tar.gz gs://$MY_PROJECT/mvgce.tar.gz
 child_pid=$!
 
 # This next step also takes awhile.
+gsutil cp mvgce.tar.gz gs://$MY_PROJECT/mvgce.tar.gz
 gcloud compute images create mvgce-$IDENTIFIER --source-uri gs://$MY_PROJECT/mvgce.tar.gz
 gcloud compute disks create mvgce-$IDENTIFIER --image mvgce-$IDENTIFIER --zone=$MY_ZONE
 
